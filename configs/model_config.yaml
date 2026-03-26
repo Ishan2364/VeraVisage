@@ -1,0 +1,25 @@
+# ─────────────────────────────────────────────
+# Hyperparameters for all deep-learning models
+# ─────────────────────────────────────────────
+embedding:
+  backbone: arcface        # arcface | facenet
+  embedding_dim: 512
+  pretrained_weights: ~    # path or null to download
+
+liveness:
+  texture_svm_C: 1.0
+  optical_flow_threshold: 0.35
+  fft_artifact_threshold: 0.60
+  blink_ear_threshold: 0.21
+  blink_consecutive_frames: 3
+  aggregator_weights:         # must sum to 1.0
+    texture:  0.25
+    depth:    0.15
+    flow:     0.20
+    blink:    0.20
+    fft:      0.10
+    dct:      0.10
+
+verification:
+  similarity_metric: cosine  # cosine | euclidean
+  accept_threshold: 0.70

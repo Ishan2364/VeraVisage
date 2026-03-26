@@ -1,0 +1,13 @@
+# ─────────────────────────────────────────────
+# Global project paths and device settings
+# ─────────────────────────────────────────────
+project_name: deepfake_auth
+
+paths:
+  raw_data:        data/raw
+  processed_data:  data/processed
+  embeddings:      data/embeddings_store
+  logs:            logs/
+
+device: cpu          # "cpu" | "cuda" | "mps"
+seed: 42
