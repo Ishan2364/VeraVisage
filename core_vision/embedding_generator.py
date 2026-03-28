@@ -84,20 +84,27 @@ class EmbeddingGenerator:
             else ["CPUExecutionProvider"]
         )
 
-        # Load ONLY the recognition module — we don't need a second detector
+        # We MUST allow all modules (or at least detection and recognition)
+        # because app.prepare() asserts that 'detection' is in self.models
         app = FaceAnalysis(
             name="buffalo_l",
-            allowed_modules=["recognition"],
             providers=providers,
         )
         app.prepare(ctx_id=0 if self.device == "cuda" else -1)
 
         # Extract just the recognition model
-        self._model = app.models.get("recognition")
-        if self._model is None:
-            # Fallback: try getting it by iterating models
-            for name, model in app.models.items():
-                if "rec" in name.lower() or "recognition" in name.lower():
+        # FaceAnalysis models is a dictionary in some versions, list in others
+        self._model = None
+        if hasattr(app, "models") and isinstance(app.models, dict):
+            self._model = app.models.get("recognition")
+        else:
+            # Fallback: try getting it by iterating models list/dict
+            items = getattr(app, "models", [])
+            items_to_iter = items.items() if isinstance(items, dict) else enumerate(items)
+            for _, model in items_to_iter:
+                # Sometimes models don't have taskname, use __class__.__name__ or taskname
+                task = getattr(model, "taskname", getattr(model.__class__, "__name__", ""))
+                if "rec" in task.lower() or "recognition" in task.lower():
                     self._model = model
                     break
 
@@ -186,7 +193,7 @@ class EmbeddingGenerator:
                 emb = self.generate(face)
                 embeddings.append(emb)
             except Exception as e:
-                log.warning("Skipping frame %d — embedding failed: %s", i, e)
+                log.warning("Skipping frame %d — embedding failed: %s", i, repr(e))
 
         if not embeddings:
             raise RuntimeError(
