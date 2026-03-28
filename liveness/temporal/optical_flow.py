@@ -1,21 +1,28 @@
 """
 liveness/temporal/optical_flow.py
 ────────────────────────────────────────────────────────────────────────────
-Landmark-based facial deformation liveness detection.
+Skin micro-motion liveness detection using dense optical flow on the
+aligned face crop.
 
-Instead of pixel-level Farneback flow on the whole frame (which picks up
-hand tremor and phone movement), we track MediaPipe facial landmark
-positions across frames and measure INTERNAL facial deformation only.
+THE CORE FIX
+─────────────
+Old approach: MediaPipe landmark deformation across frames.
+Problem:      MediaPipe landmark positions jitter on screen faces,
+              creating fake deformation even on static screens.
 
-KEY INSIGHT
-────────────
-By subtracting the face centroid before computing displacement, we remove
-all rigid body motion (phone moving, hand tremor, camera shake).
-Only internal facial deformation remains.
+New approach: Dense Farneback optical flow on the SKIN REGION of the
+              aligned 112x112 face crop.
 
-  Printed photo held still:  zero deformation → SPOOF
-  Printed photo moved:       centroid subtracted → still zero deformation → SPOOF
-  Live face sitting still:   breathing causes ~0.2-0.8px deformation → LIVE
+WHY THIS WORKS
+──────────────
+Real skin has constant micro-motion from:
+  - Blood flow causing sub-pixel skin colour changes
+  - Breathing causing subtle scale changes
+  - Muscle micro-expressions
+
+A screen-displayed or printed face has:
+  - Zero skin micro-motion (static pixels)
+  - Screen refresh artifacts (high frequency, easily filtered)
 ────────────────────────────────────────────────────────────────────────────
 """
 
@@ -30,31 +37,53 @@ from liveness.base_liveness_check import BaseLivenessCheck
 
 log = get_logger(__name__)
 
-# Key landmark indices — spread across face for good coverage
-# Nose tip, chin, left cheek, right cheek, forehead, eye corners, mouth corners
-KEY_LANDMARKS = [1, 152, 234, 454, 10, 33, 263, 61, 291]
+# ── Farneback parameters ──────────────────────────────────────────────────
+FARNEBACK_PARAMS = dict(
+    pyr_scale=0.5,
+    levels=2,
+    winsize=8,      # small window — sensitive to micro-motion
+    iterations=2,
+    poly_n=5,
+    poly_sigma=1.1,
+    flags=0,
+)
 
-MIN_MOTION_MAGNITUDE = 0.0005
+# Skin ROI on the 112x112 aligned crop
+# Central region: nose bridge to chin, avoiding eye/mouth edges
+SKIN_ROI = {
+    "y1": 40,   # below the eyes
+    "y2": 85,   # above the chin
+    "x1": 28,   # left edge of nose
+    "x2": 84,   # right edge of nose
+}
+
+# Thresholds
+MIN_SKIN_MOTION     = 0.005    # below this = static (screen/photo)
+OPTIMAL_MAX_MOTION  = 0.20     # above this starts getting suspicious (shaky cam)
+MAX_SKIN_MOTION     = 3.0      # above this = too much motion (alignment fail)
+MIN_MOTION_VARIANCE = 0.00001  # below this = unnaturally uniform
 
 
 class OpticalFlowChecker(BaseLivenessCheck):
     """
-    Detects liveness by measuring internal facial landmark deformation.
-    Immune to whole-frame motion (phone attacks, hand tremor).
+    Detects liveness by measuring skin micro-motion on aligned face crops.
+
+    Works on the 112x112 aligned crop from FaceAligner — not the full frame.
+    Immune to whole-frame motion (phone attacks) because we measure
+    internal skin texture motion, not positional changes.
     """
 
     def __init__(
         self,
         min_frames: int = 8,
-        motion_threshold: float = MIN_MOTION_MAGNITUDE,
+        motion_threshold: float = MIN_SKIN_MOTION,
     ):
         self.min_frames       = min_frames
         self.motion_threshold = motion_threshold
-        self._face_mesh       = None
 
         log.info(
-            "OpticalFlowChecker initialised — "
-            "motion_threshold=%.5f (landmark mode)",
+            "OpticalFlowChecker (skin micro-motion) — "
+            "motion_threshold=%.4f",
             motion_threshold,
         )
 
@@ -62,101 +91,107 @@ class OpticalFlowChecker(BaseLivenessCheck):
     def name(self) -> str:
         return "optical_flow"
 
-    def _load_mediapipe(self) -> None:
-        """Lazy-load MediaPipe FaceMesh."""
-        if self._face_mesh is not None:
-            return
-        try:
-            import mediapipe as mp
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-            log.info("OpticalFlowChecker: MediaPipe FaceMesh loaded")
-        except ImportError:
-            raise ImportError("Run: pip install mediapipe==0.10.14")
+    def _extract_skin_roi(self, aligned_crop: np.ndarray) -> np.ndarray:
+        """
+        Extract the central skin region, convert to grayscale, and blur 
+        slightly to eliminate high-frequency ISO camera noise.
+        """
+        roi = aligned_crop[
+            SKIN_ROI["y1"]:SKIN_ROI["y2"],
+            SKIN_ROI["x1"]:SKIN_ROI["x2"],
+        ]
+        
+        # Convert to grayscale for flow computation
+        if len(roi.shape) == 3:
+            roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            
+        # Apply slight blur to kill sensor noise, preserving actual physical motion
+        roi = cv2.GaussianBlur(roi, (3, 3), 0)
+        
+        return roi
 
     def _compute_flow_stats(
-        self, frames: list[np.ndarray]
+        self, aligned_frames: list[np.ndarray]
     ) -> dict:
         """
-        Compute centroid-normalised landmark displacement across frames.
-
-        Subtracting the centroid removes rigid body motion — only internal
-        facial deformation remains, which is zero for a photo.
+        Compute dense optical flow statistics on skin ROI across frames.
         """
-        self._load_mediapipe()
+        empty_stats = {
+            "mean_magnitude":     0.0,
+            "magnitude_variance": 0.0,
+            "flow_pairs":         0,
+            "magnitudes":         [],
+        }
 
-        landmark_positions = []
+        if len(aligned_frames) < 2:
+            return empty_stats
 
-        for frame in frames:
-            rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = self._face_mesh.process(rgb)
+        # Extract skin ROI from each frame
+        roi_frames = []
+        for frame in aligned_frames:
+            roi = self._extract_skin_roi(frame)
+            if roi.size > 0:
+                roi_frames.append(roi)
 
-            if not result.multi_face_landmarks:
-                continue
+        if len(roi_frames) < 2:
+            return empty_stats
 
-            h, w = frame.shape[:2]
-            lm   = result.multi_face_landmarks[0].landmark
-            positions = np.array(
-                [[lm[i].x * w, lm[i].y * h] for i in KEY_LANDMARKS],
-                dtype=np.float32,
+        magnitudes = []
+
+        for i in range(len(roi_frames) - 1):
+            prev = roi_frames[i]
+            curr = roi_frames[i + 1]
+
+            # Compute dense optical flow
+            flow = cv2.calcOpticalFlowFarneback(
+                prev, curr, None, **FARNEBACK_PARAMS
             )
-            landmark_positions.append(positions)
 
-        if len(landmark_positions) < 2:
-            return {
-                "mean_magnitude":     0.0,
-                "magnitude_variance": 0.0,
-                "mean_entropy":       0.0,
-                "flow_pairs":         0,
-                "magnitudes":         [],
-            }
+            # Separate X and Y motion vectors
+            dx = flow[..., 0]
+            dy = flow[..., 1]
 
-        displacements = []
+            # --- THE FIX: GLOBAL MOTION SUBTRACTION ---
+            # 1. Find the median movement of the entire ROI (this isolates the hand-shake / box jitter)
+            global_dx = np.median(dx)
+            global_dy = np.median(dy)
 
-        for i in range(len(landmark_positions) - 1):
-            prev = landmark_positions[i]
-            curr = landmark_positions[i + 1]
+            # 2. Subtract the global movement to isolate purely LOCAL pixel deformation
+            local_dx = dx - global_dx
+            local_dy = dy - global_dy
 
-            # Subtract centroid — removes whole-face translation
-            prev_norm = prev - prev.mean(axis=0)
-            curr_norm = curr - curr.mean(axis=0)
+            # 3. Calculate magnitude of ONLY the isolated local motion
+            local_mag, _ = cv2.cartToPolar(local_dx, local_dy)
 
-            # Internal deformation magnitude
-            delta     = curr_norm - prev_norm
-            magnitude = float(np.linalg.norm(delta, axis=1).mean())
-            displacements.append(magnitude)
+            # Use median of the local magnitudes
+            median_mag = float(np.median(local_mag))
+            magnitudes.append(median_mag)
 
-        displacements = np.array(displacements)
+            log.debug(
+                "Skin flow pair %d->%d: median_local_mag=%.5f",
+                i, i + 1, median_mag,
+            )
 
+        if not magnitudes:
+            return empty_stats
+
+        magnitudes_arr = np.array(magnitudes)
         return {
-            "mean_magnitude":     float(displacements.mean()),
-            "magnitude_variance": float(displacements.var()),
-            "mean_entropy":       float(displacements.std()),
-            "flow_pairs":         len(displacements),
-            "magnitudes":         displacements.tolist(),
+            "mean_magnitude":     float(magnitudes_arr.mean()),
+            "magnitude_variance": float(magnitudes_arr.var()),
+            "flow_pairs":         len(magnitudes_arr),
+            "magnitudes":         magnitudes_arr.tolist(),
         }
 
     @timer
     def check(self, frames: list[np.ndarray]) -> float:
         """
-        Run landmark deformation liveness check on a frame sequence.
-
-        Args:
-            frames: Full BGR camera frames (not aligned crops).
-                    Minimum 8 frames recommended.
-
-        Returns:
-            Liveness confidence in [0.0, 1.0]:
-              0.0 = no facial deformation (static photo)
-              0.5+ = facial micro-motion detected (live face)
+        Run skin micro-motion liveness check.
+        Returns a confidence score in [0.0, 1.0].
         """
         if not frames or len(frames) < 2:
             log.warning(
-                "OpticalFlowChecker needs ≥2 frames, got %d",
+                "OpticalFlowChecker needs >=2 frames, got %d",
                 len(frames) if frames else 0,
             )
             return 0.0
@@ -166,26 +201,42 @@ class OpticalFlowChecker(BaseLivenessCheck):
         variance = stats["magnitude_variance"]
 
         log.info(
-            "Landmark flow — mean_deformation=%.5f, variance=%.6f, pairs=%d",
+            "Skin flow — mean=%.5f, variance=%.6f, pairs=%d",
             mean_mag, variance, stats["flow_pairs"],
         )
 
-        # Gate: no deformation → static image
+        # Gate 1: No motion → static image (photo or screen)
         if mean_mag < self.motion_threshold:
             log.info(
-                "Flow: SPOOF — no facial deformation (%.5f < %.5f)",
+                "Flow: SPOOF — no skin micro-motion (%.5f < %.4f)",
                 mean_mag, self.motion_threshold,
             )
             return 0.0
 
-        # Score based on deformation magnitude and variance
-        magnitude_score = float(min(1.0, mean_mag / 0.5))
-        variance_score  = float(min(1.0, variance / 0.01))
+        # Gate 2: Excessive motion → alignment failure or chaotic movement
+        if mean_mag > MAX_SKIN_MOTION:
+            log.info("Flow: low confidence — excessive motion")
+            return 0.3
+
+        # Gate 3: Uniform motion → possible replay artifact
+        if variance < MIN_MOTION_VARIANCE:
+            log.info("Flow: suspicious — unnaturally uniform motion")
+            return 0.35
+
+        # Goldilocks Scoring: Penalize if motion is unusually high to prevent "shaky camera" bypasses
+        if mean_mag <= OPTIMAL_MAX_MOTION:
+            # Ramps up normally to 1.0
+            magnitude_score = float(min(1.0, mean_mag / 0.1))
+        else:
+            # Scales linearly down as motion gets chaotic
+            magnitude_score = float(max(0.0, 1.0 - ((mean_mag - OPTIMAL_MAX_MOTION) / (MAX_SKIN_MOTION - OPTIMAL_MAX_MOTION))))
+
+        variance_score = float(min(1.0, variance / 0.0005))
 
         score = float(np.clip(
-            0.50 * magnitude_score + 0.50 * variance_score,
+            0.60 * magnitude_score + 0.40 * variance_score,
             0.0, 1.0,
         ))
 
-        log.info("OpticalFlow score: %.4f", score)
+        log.info("OpticalFlow (skin) score: %.4f", score)
         return score
